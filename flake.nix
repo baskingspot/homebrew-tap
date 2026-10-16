@@ -19,13 +19,7 @@
           devShells.default = pkgs.mkShell {
             inputsFrom = [ config.devShells.base ];
 
-            packages = with pkgs; [
-              oxfmt
-              python3
-              ruff
-              ty
-              yq-go
-            ];
+            packages = [ pkgs.oxfmt ];
           };
         };
     };
