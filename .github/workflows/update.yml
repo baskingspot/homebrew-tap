@@ -1,0 +1,187 @@
+name: update
+
+# Every hour, write a cask for each baskingspot program with a release, test
+# the casks on Homebrew itself (Linux and macOS), and only then commit them.
+# A cask that fails never reaches main, and the run goes red.
+#
+# It needs no token beyond the workflow's own, and nothing in the program
+# repos has to know the tap exists: a program opts in by having
+# .github/release.yaml. GitHub disables a schedule after 60 days without
+# activity in a public repo, so the heartbeat job commits a dated file when
+# nothing else has in 30 days.
+on:
+  schedule:
+    - cron: "17 * * * *"
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: update
+  cancel-in-progress: false
+
+jobs:
+  generate:
+    runs-on: ubuntu-26.04
+    permissions:
+      contents: read
+    outputs:
+      changed: ${{ steps.diff.outputs.changed }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Write the casks
+        run: python3 tools/update.py
+        env:
+          GH_TOKEN: ${{ github.token }}
+      - name: Did anything change
+        id: diff
+        run: |
+          git add -A Casks
+          if git diff --cached --quiet; then
+            echo "changed=false" >> "${GITHUB_OUTPUT}"
+          else
+            git diff --cached --stat
+            echo "changed=true" >> "${GITHUB_OUTPUT}"
+          fi
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: steps.diff.outputs.changed == 'true'
+        with:
+          name: casks
+          path: Casks
+          if-no-files-found: ignore
+
+  check:
+    needs: generate
+    if: needs.generate.outputs.changed == 'true'
+    name: check on ${{ matrix.runner }}
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-26.04, macos-26]
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: casks
+          path: casks
+      - name: Find Homebrew
+        run: |
+          if [ -d /home/linuxbrew/.linuxbrew/bin ]; then
+            echo /home/linuxbrew/.linuxbrew/bin >> "${GITHUB_PATH}"
+          fi
+      - name: Put the casks in a local tap
+        run: |
+          brew --version
+          brew tap-new --no-git baskingspot/check
+          mkdir -p "$(brew --repository baskingspot/check)/Casks"
+          cp casks/*.rb "$(brew --repository baskingspot/check)/Casks/"
+      - name: Style and audit
+        run: |
+          brew style baskingspot/check
+          for cask in casks/*.rb; do
+            brew audit --cask "baskingspot/check/$(basename "${cask}" .rb)"
+          done
+      - name: Install each cask and run its program
+        run: |
+          for cask in casks/*.rb; do
+            name=$(basename "${cask}" .rb)
+            brew install --cask "baskingspot/check/${name}"
+            # The binary stanza names the program, as folder/program.
+            binary=$(sed -n 's|^ *binary ".*/\(.*\)"$|\1|p' "${cask}" | head -n 1)
+            path="$(brew --prefix)/bin/${binary}"
+            test -x "${path}"
+            "${path}" --help > /dev/null
+            if [ "$(uname)" = Darwin ]; then
+              # The postflight must have removed the quarantine flag.
+              if xattr -p com.apple.quarantine "${path}" 2> /dev/null; then
+                echo "${path} is still quarantined" >&2
+                exit 1
+              fi
+            fi
+          done
+
+  publish:
+    needs: [generate, check]
+    runs-on: ubuntu-26.04
+    permissions:
+      contents: write # one signed commit to main
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: casks
+          path: casks
+      - name: Commit the casks
+        # GitHub's createCommitOnBranch API signs the commit as the workflow.
+        run: |
+          set -euo pipefail
+          rm -rf Casks
+          mkdir Casks
+          cp casks/*.rb Casks/
+          git add -A Casks
+          additions='[]'
+          deletions='[]'
+          while IFS=$'\t' read -r status path; do
+            if [ "${status}" = D ]; then
+              deletions=$(jq -c --arg p "${path}" '. + [{path: $p}]' <<< "${deletions}")
+            else
+              additions=$(jq -c --arg p "${path}" --arg c "$(base64 -w0 "${path}")" \
+                '. + [{path: $p, contents: $c}]' <<< "${additions}")
+            fi
+          done < <(git diff --cached --name-status)
+          headline="casks: $(git diff --cached --name-only | sed 's|Casks/||; s|\.rb$||' | paste -sd ' ' -)"
+          jq -n \
+            --arg repo "${GITHUB_REPOSITORY}" --arg head "$(git rev-parse HEAD)" \
+            --arg headline "${headline}" \
+            --argjson additions "${additions}" --argjson deletions "${deletions}" \
+            '{
+              query: "mutation($input: CreateCommitOnBranchInput!) { createCommitOnBranch(input: $input) { commit { url } } }",
+              variables: { input: {
+                branch: { repositoryNameWithOwner: $repo, branchName: "main" },
+                message: { headline: $headline },
+                fileChanges: { additions: $additions, deletions: $deletions },
+                expectedHeadOid: $head
+              } }
+            }' | gh api graphql --input - --jq '.data.createCommitOnBranch.commit.url'
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+  heartbeat:
+    needs: generate
+    if: needs.generate.outputs.changed == 'false'
+    runs-on: ubuntu-26.04
+    permissions:
+      contents: write # one signed commit to main, at most once a month
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Commit a dated file if the repo has been quiet for 30 days
+        run: |
+          set -euo pipefail
+          age=$(( $(date +%s) - $(git log -1 --format=%ct) ))
+          if [ "${age}" -lt $(( 30 * 86400 )) ]; then
+            echo "The last commit is $(( age / 86400 )) days old. Nothing to do."
+            exit 0
+          fi
+          date -u +%F > .last-run
+          jq -n \
+            --arg repo "${GITHUB_REPOSITORY}" --arg head "$(git rev-parse HEAD)" \
+            --arg contents "$(base64 -w0 .last-run)" \
+            '{
+              query: "mutation($input: CreateCommitOnBranchInput!) { createCommitOnBranch(input: $input) { commit { url } } }",
+              variables: { input: {
+                branch: { repositoryNameWithOwner: $repo, branchName: "main" },
+                message: { headline: "tap: still running" },
+                fileChanges: { additions: [{ path: ".last-run", contents: $contents }] },
+                expectedHeadOid: $head
+              } }
+            }' | gh api graphql --input - --jq '.data.createCommitOnBranch.commit.url'
+        env:
+          GH_TOKEN: ${{ github.token }}
