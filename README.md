@@ -16,7 +16,7 @@ brew install --cask zigdoc
 
 Homebrew 6 and later asks you to trust a third-party tap before it runs the tap's code. Follow its prompt, or run `brew trust baskingspot/tap`.
 
-Each cask installs the program's release tarball for your platform. The release binaries are not signed or notarized, so the cask clears macOS's quarantine flag after install. Check a download yourself with `gh attestation verify FILE -R baskingspot/PROGRAM`.
+Each cask installs the program's release tarball for your platform. The release binaries are not signed or notarized, so the cask clears macOS's quarantine flag after install. Check a download yourself with `gh attestation verify FILE -R baskingspot/PROGRAM --signer-repo baskingspot/gh-actions`.
 
 ## Where the casks come from
 
