@@ -19,7 +19,6 @@
           devShells.default = pkgs.mkShell {
             inputsFrom = [ config.devShells.base ];
 
-            packages = [ pkgs.oxfmt ];
           };
         };
     };
